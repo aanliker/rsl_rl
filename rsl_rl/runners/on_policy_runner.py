@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import os
 import statistics
-import time
+import neptune
+import shutil
+
 import torch
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
@@ -20,8 +22,15 @@ from rsl_rl.utils import store_code_state
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
-    def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
-        self.cfg = train_cfg
+    def __init__(self,
+                 env: VecEnv,
+                 train_cfg,
+                 log_dir=None,
+                 tensorboard_path=None,
+                 device='cpu',
+                 pretrained_model_path=None):
+
+        self.cfg=train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
@@ -31,13 +40,21 @@ class OnPolicyRunner:
         if "critic" in extras["observations"]:
             num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
-            num_critic_obs = num_obs
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
-            num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
-        alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+            num_critic_obs = self.env.num_obs
+        actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
+        if pretrained_model_path is not None:
+            self.actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class( self.env.num_obs,
+                                                        num_critic_obs,
+                                                        self.env.num_actions,
+                                                        **self.policy_cfg).to(self.device)
+            self.actor_critic.load_state_dict(torch.load(pretrained_model_path)['model_state_dict'])
+        else:
+            self.actor_critic: ActorCritic | ActorCriticRecurrent= actor_critic_class( self.env.num_obs,
+                                                    num_critic_obs,
+                                                    self.env.num_actions,
+                                                    **self.policy_cfg).to(self.device)
+        alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
+        self.alg: PPO = alg_class(self.actor_critic, device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
@@ -48,23 +65,17 @@ class OnPolicyRunner:
             self.obs_normalizer = torch.nn.Identity()  # no normalization
             self.critic_obs_normalizer = torch.nn.Identity()  # no normalization
         # init storage and model
-        self.alg.init_storage(
-            self.env.num_envs,
-            self.num_steps_per_env,
-            [num_obs],
-            [num_critic_obs],
-            [self.env.num_actions],
-        )
-
+        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
+  
         # Log
         self.log_dir = log_dir
+        self.writer_log = tensorboard_path 
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
-        self.git_status_repos = [rsl_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    def learn(self, num_learning_iterations: int, run=None, init_at_random_ep_len: bool = False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
@@ -82,7 +93,7 @@ class OnPolicyRunner:
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
-                self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
+                self.writer = TensorboardSummaryWriter(log_dir=self.writer_log, flush_secs=10)
             else:
                 raise AssertionError("logger type not found")
 
@@ -153,15 +164,12 @@ class OnPolicyRunner:
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                os.makedirs(self.log_dir, exist_ok=True)
+                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.upload_tensorboard() if self.writer_log is not None else None
             ep_infos.clear()
             if it == start_iter:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
+                store_code_state(self.log_dir, self.git_status_repos)
 
         self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
@@ -302,3 +310,8 @@ class OnPolicyRunner:
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
+
+    def upload_tensorboard(self):
+        # Copy tensorboard logs to log_dir (to upload to s3 bucket)
+        shutil.copytree(self.writer_log, self.log_dir, dirs_exist_ok=True)
+
