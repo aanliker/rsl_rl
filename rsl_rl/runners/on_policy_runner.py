@@ -32,6 +32,8 @@ import time
 import os
 from collections import deque
 import statistics
+import neptune
+import shutil
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
@@ -47,7 +49,9 @@ class OnPolicyRunner:
                  env: VecEnv,
                  train_cfg,
                  log_dir=None,
-                 device='cpu'):
+                 tensorboard_path=None,
+                 device='cpu',
+                 pretrained_model_path=None):
 
         self.cfg=train_cfg["runner"]
         self.alg_cfg = train_cfg["algorithm"]
@@ -59,20 +63,28 @@ class OnPolicyRunner:
         else:
             num_critic_obs = self.env.num_obs
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
-        actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
+        if pretrained_model_path is not None:
+            self.actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
                                                         num_critic_obs,
                                                         self.env.num_actions,
                                                         **self.policy_cfg).to(self.device)
+            self.actor_critic.load_state_dict(torch.load(pretrained_model_path)['model_state_dict'])
+        else:
+            self.actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
+                                                    num_critic_obs,
+                                                    self.env.num_actions,
+                                                    **self.policy_cfg).to(self.device)
         alg_class = eval(self.cfg["algorithm_class_name"]) # PPO
-        self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        self.alg: PPO = alg_class(self.actor_critic, device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
         # init storage and model
         self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
-
+  
         # Log
         self.log_dir = log_dir
+        self.writer_log = tensorboard_path 
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
@@ -80,10 +92,10 @@ class OnPolicyRunner:
 
         _, _ = self.env.reset()
     
-    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+    def learn(self, num_learning_iterations, run=None, init_at_random_ep_len=False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
-            self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            self.writer = SummaryWriter(log_dir=self.writer_log)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
         obs = self.env.get_observations()
@@ -135,7 +147,9 @@ class OnPolicyRunner:
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
+                os.makedirs(self.log_dir, exist_ok=True)
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.upload_tensorboard() if self.writer_log is not None else None
             ep_infos.clear()
         
         self.current_learning_iteration += num_learning_iterations
@@ -231,3 +245,8 @@ class OnPolicyRunner:
         if device is not None:
             self.alg.actor_critic.to(device)
         return self.alg.actor_critic.act_inference
+
+    def upload_tensorboard(self):
+        # Copy tensorboard logs to log_dir (to upload to s3 bucket)
+        shutil.copytree(self.writer_log, self.log_dir, dirs_exist_ok=True)
+
